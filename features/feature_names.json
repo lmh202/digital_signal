@@ -1,0 +1,18 @@
+[
+  "main_frequency",
+  "spectral_centroid",
+  "spectral_bandwidth",
+  "band_energy_0_2k",
+  "band_energy_2k_5k",
+  "band_energy_5k_10k",
+  "band_energy_10k_15k",
+  "band_energy_15k_25.6k",
+  "peak_freq_1",
+  "peak_freq_2",
+  "peak_freq_3",
+  "peak_freq_4",
+  "peak_freq_5",
+  "rms",
+  "peak_amplitude",
+  "zero_crossing_rate"
+]

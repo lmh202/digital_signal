@@ -1,0 +1,29 @@
+{
+  "accuracy": 0.7532467532467533,
+  "num_classes": 10,
+  "class_labels": [
+    "400",
+    "800",
+    "1200",
+    "1600",
+    "2000",
+    "2400",
+    "2800",
+    "3200",
+    "3600",
+    "4000"
+  ],
+  "train_samples": 305,
+  "test_samples": 77,
+  "feature_dim": 16,
+  "model_architecture": {
+    "hidden_sizes": [
+      128,
+      64,
+      32
+    ],
+    "epochs": 200,
+    "batch_size": 32,
+    "learning_rate": 0.001
+  }
+}
