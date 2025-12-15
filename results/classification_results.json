@@ -1,5 +1,5 @@
 {
-  "accuracy": 0.7654320987654321,
+  "accuracy": 0.8641975308641975,
   "num_classes": 10,
   "class_labels": [
     "400",
@@ -22,7 +22,7 @@
       64,
       32
     ],
-    "epochs": 200,
+    "epochs": 4000,
     "batch_size": 32,
     "learning_rate": 0.001
   }

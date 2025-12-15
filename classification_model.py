@@ -18,6 +18,19 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 import warnings
 warnings.filterwarnings('ignore')
 
+# 导入特征权重配置
+try:
+    from feature_weights_config import FEATURE_WEIGHTS, USE_FEATURE_WEIGHTS
+    print("✅ 已从 feature_weights_config.py 加载特征权重配置")
+except ImportError:
+    print("⚠️  未找到 feature_weights_config.py，使用默认权重配置")
+    # 默认权重（根据特征重要性图设置）
+    FEATURE_WEIGHTS = np.array([
+        0.02, 0.05, 0.06, 0.08, 0.08, 0.11, 0.05, 0.05,
+        0.03, 0.12, 0.16, 0.04, 0.03, 0.09, 0.05, 0.03
+    ])
+    USE_FEATURE_WEIGHTS = True
+
 # 尝试导入深度学习框架
 try:
     import torch
@@ -41,7 +54,7 @@ MODEL_DIR = "models"
 RESULT_DIR = "results"
 
 # 训练参数
-EPOCHS = 200
+EPOCHS = 1200
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
 HIDDEN_SIZES = [128, 64, 32]
@@ -73,6 +86,31 @@ def load_features():
     return X, y, feature_names
 
 
+def print_feature_weights(feature_names):
+    """打印当前的特征权重配置"""
+    print("\n" + "="*60)
+    print("特征权重配置")
+    print("="*60)
+    print(f"启用状态: {'✅ 已启用' if USE_FEATURE_WEIGHTS else '❌ 未启用'}")
+    
+    if USE_FEATURE_WEIGHTS:
+        print(f"\n{'索引':<6} {'特征名':<30} {'权重':<10} {'归一化权重':<12}")
+        print("-" * 60)
+        
+        # 归一化权重（总和=特征数）
+        weights_normalized = FEATURE_WEIGHTS / FEATURE_WEIGHTS.sum() * len(feature_names)
+        
+        for i, (name, weight, norm_weight) in enumerate(zip(feature_names, FEATURE_WEIGHTS, weights_normalized)):
+            print(f"{i:<6} {name:<30} {weight:<10.4f} {norm_weight:<12.4f}")
+        
+        print("-" * 60)
+        print(f"权重总和: {FEATURE_WEIGHTS.sum():.4f}")
+        print(f"归一化权重总和: {weights_normalized.sum():.4f}")
+        print(f"建议: 根据特征重要性图调整FEATURE_WEIGHTS数组")
+    
+    print("="*60)
+
+
 def preprocess_data(X, y, test_size=TEST_SIZE):
     """数据预处理"""
     print("\n数据预处理...")
@@ -81,9 +119,26 @@ def preprocess_data(X, y, test_size=TEST_SIZE):
     label_encoder = LabelEncoder()
     y_encoded = label_encoder.fit_transform(y)
     
+    # 应用特征权重（如果启用）
+    if USE_FEATURE_WEIGHTS:
+        print(f"应用特征权重...")
+        # 确保权重维度匹配
+        if len(FEATURE_WEIGHTS) != X.shape[1]:
+            print(f"⚠️  警告：特征权重维度({len(FEATURE_WEIGHTS)})与特征数({X.shape[1]})不匹配，将不应用权重")
+            X_weighted = X.copy()
+        else:
+            # 归一化权重，使其和为特征数（保持总体尺度）
+            weights_normalized = FEATURE_WEIGHTS / FEATURE_WEIGHTS.sum() * X.shape[1]
+            X_weighted = X * weights_normalized[np.newaxis, :]
+            print(f"✅ 已应用特征权重，归一化因子={weights_normalized.sum()/X.shape[1]:.4f}")
+            print(f"   权重范围: [{weights_normalized.min():.4f}, {weights_normalized.max():.4f}]")
+    else:
+        print("未启用特征权重，使用原始特征")
+        X_weighted = X.copy()
+    
     # 数据标准化
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_weighted)
     
     # 划分训练集和测试集
     X_train, X_test, y_train, y_test = train_test_split(
@@ -109,7 +164,7 @@ class NeuralNetwork(nn.Module):
             layers.append(nn.Linear(prev_size, hidden_size))
             layers.append(nn.BatchNorm1d(hidden_size))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.3))
+            layers.append(nn.Dropout(0.08))
             prev_size = hidden_size
         
         layers.append(nn.Linear(prev_size, num_classes))
@@ -465,6 +520,9 @@ def main():
     
     # 加载特征
     X, y, feature_names = load_features()
+    
+    # 打印特征权重配置
+    print_feature_weights(feature_names)
     
     # 数据预处理
     X_train, X_test, y_train, y_test, scaler, label_encoder = preprocess_data(X, y)
