@@ -132,7 +132,7 @@ def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
     
     # 创建数据加载器
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     
     # 创建模型
     input_size = X_train.shape[1]

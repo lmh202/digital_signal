@@ -1,5 +1,5 @@
 {
-  "accuracy": 0.7532467532467533,
+  "accuracy": 0.7654320987654321,
   "num_classes": 10,
   "class_labels": [
     "400",
@@ -13,8 +13,8 @@
     "3600",
     "4000"
   ],
-  "train_samples": 305,
-  "test_samples": 77,
+  "train_samples": 321,
+  "test_samples": 81,
   "feature_dim": 16,
   "model_architecture": {
     "hidden_sizes": [

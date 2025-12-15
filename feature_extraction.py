@@ -1,7 +1,14 @@
 """
 槽楔模型测试数据分析 - 特征提取脚本
-功能：
-1. 读取不同松紧度下的采样数据
+功能：# 端点检测参数（基于阈值回落+最大事件时长）
+BANDPASS_LOW = 100  # 带通滤波器低频截止 (Hz)
+BANDPASS_HIGH = 15000  # 带通滤波器高频截止 (Hz)
+ENVELOPE_WINDOW_SIZE = 128  # 包络平滑窗口大小（采样点）
+PEAK_PROMINENCE = 0.3  # 峰值显著性阈值（相对于信号最大值的比例）
+PEAK_MIN_DISTANCE = 0.1  # 相邻峰值最小间隔（秒）
+PEAK_DECAY_THRESHOLD = 0.1  # 峰值衰减阈值（相对于该峰峰值的比例）- 主要切分依据
+MAX_EVENT_DURATION = 0.05  # 最大事件时长（秒）- 每次敲击振铃最长50ms
+MIN_PEAK_SPACING = 0.02  # 最小峰间距（秒）- 当两峰小于此值时触发防跨峰机制松紧度下的采样数据
 2. 时域上分离每一次敲击的信号（端点检测）
 3. 选定合适的时域信号长度
 4. 对选定的信号进行频域变换
@@ -27,17 +34,21 @@ SAMPLE_RATE = 51200  # 采样率 Hz
 DATA_DIR = "."  # 数据目录
 OUTPUT_DIR = "features"  # 输出目录
 
-# 端点检测参数（基于包络峰值检测）
+# 端点检测参数（基于双门限阈值法 - 改进版）
 BANDPASS_LOW = 100  # 带通滤波器低频截止 (Hz)
 BANDPASS_HIGH = 15000  # 带通滤波器高频截止 (Hz)
-ENVELOPE_WINDOW_SIZE = 256  # 包络平滑窗口大小（采样点）
-PEAK_PROMINENCE = 0.3  # 峰值显著性阈值（相对于信号最大值的比例）
-PEAK_MIN_DISTANCE = 0.5  # 相邻峰值最小间隔（秒）
-SEGMENT_BEFORE_PEAK = 0.01  # 峰值前截取长度（秒）
-SEGMENT_AFTER_PEAK = 0.08  # 峰值后截取长度（秒）
+
+# 双门限法参数（改进：直接在包络上检测峰值）
+MIN_PEAK_AMPLITUDE = 0.18  # 候选峰的最小包络幅值（绝对值）- 关键参数
+PEAK_HIGH_THRESHOLD_RATIO = 0.60  # 高门限：相对于峰值的比例（用于边界扩展）
+PEAK_LOW_THRESHOLD_RATIO = 0.30  # 低门限：相对于峰值的比例（用于边界扩展）
+PEAK_MIN_DISTANCE = 0.05  # 相邻峰值最小间隔（秒）
+MAX_EVENT_DURATION = 0.08  # 最大事件时长（秒）
+MIN_EVENT_DURATION = 0.010  # 最小事件时长（秒）- 用于过滤毛刺噪声（< 10ms认为是噪声）
+MIN_SEGMENT_SAMPLES = 256  # 最小段长度（采样点），避免切得太短
 
 # 信号截取参数
-SIGNAL_DURATION = 0.07  # 截取的信号长度（秒）- 根据附图4选择约70ms
+SIGNAL_DURATION = 0.02  # 截取的信号长度（秒）
 SIGNAL_SAMPLES = int(SIGNAL_DURATION * SAMPLE_RATE)  # 对应的采样点数
 
 
@@ -62,12 +73,12 @@ def load_data(filepath):
     return data
 
 
-def compute_envelope(signal_data, window_size=ENVELOPE_WINDOW_SIZE, sample_rate=SAMPLE_RATE, 
+def compute_envelope(signal_data, sample_rate=SAMPLE_RATE, 
                      low_freq=BANDPASS_LOW, high_freq=BANDPASS_HIGH):
     """
-    计算信号包络
+    计算信号包络（用于可视化）
     步骤：
-    1. 带通滤波（可选，去除直流和高频噪声）
+    1. 带通滤波（去除直流和高频噪声）
     2. 整流（取绝对值）
     3. 低通滤波平滑（移动平均）
     """
@@ -81,7 +92,8 @@ def compute_envelope(signal_data, window_size=ENVELOPE_WINDOW_SIZE, sample_rate=
     # 整流
     rectified = np.abs(filtered_signal)
     
-    # 移动平均平滑（低通滤波）
+    # 移动平均平滑（使用固定窗口512）
+    window_size = 512
     window = np.ones(window_size) / window_size
     envelope = np.convolve(rectified, window, mode='same')
     
@@ -90,40 +102,153 @@ def compute_envelope(signal_data, window_size=ENVELOPE_WINDOW_SIZE, sample_rate=
 
 def detect_endpoints(signal_data, sample_rate=SAMPLE_RATE):
     """
-    端点检测：使用包络峰值检测敲击信号
-    返回：敲击段的起始和结束位置列表 [(start1, end1), (start2, end2), ...]
+    端点检测：双门限阈值法（改进版 - 直接在包络上检测峰值）
+    
+    算法流程：
+        1. 计算信号包络
+        2. 使用find_peaks在包络上直接检测峰值，要求峰值幅值 > MIN_PEAK_AMPLITUDE
+        3. 对每个峰值使用双门限扩展边界：
+           - 高门限 = 峰值 × PEAK_HIGH_THRESHOLD_RATIO（如0.6）
+           - 低门限 = 峰值 × PEAK_LOW_THRESHOLD_RATIO（如0.3）
+        4. 从峰值向前后扩展到低于低门限的位置
+    
+    参数:
+        signal_data: 原始信号数据 (1D numpy array)
+        sample_rate: 采样率 (Hz)
+    
+    返回:
+        segments: 列表 [(start1, end1, peak1), (start2, end2, peak2), ...]
+                 start/end 是样本索引，peak 是峰值位置索引
+    
+    外露参数（在文件顶部定义）:
+        MIN_PEAK_AMPLITUDE: 候选峰的最小包络幅值
+        PEAK_HIGH_THRESHOLD_RATIO: 高门限比例
+        PEAK_LOW_THRESHOLD_RATIO: 低门限比例
+        PEAK_MIN_DISTANCE: 相邻峰值最小间隔
+        MAX_EVENT_DURATION: 最大事件时长
     """
     from scipy.signal import find_peaks
     
-    # 1. 计算包络
+    # 步骤1: 计算包络
     envelope = compute_envelope(signal_data, sample_rate=sample_rate)
     
-    # 2. 在包络上检测峰值
-    max_amplitude = np.max(envelope)
-    prominence_threshold = max_amplitude * PEAK_PROMINENCE
+    # 步骤2: 在包络上检测峰值（必须满足最小幅值要求）
     min_distance_samples = int(PEAK_MIN_DISTANCE * sample_rate)
     
     peaks, properties = find_peaks(
         envelope,
-        prominence=prominence_threshold,
+        height=MIN_PEAK_AMPLITUDE,  # 关键：峰值必须大于0.18
         distance=min_distance_samples
     )
     
-    # 3. 对每个峰值，定义信号段（峰值前后一定范围）
-    segments = []
-    before_samples = int(SEGMENT_BEFORE_PEAK * sample_rate)
-    after_samples = int(SEGMENT_AFTER_PEAK * sample_rate)
+    if len(peaks) == 0:
+        print("  ⚠️  警告：未检测到任何峰值！")
+        return []
     
-    for peak in peaks:
-        start = max(0, peak - before_samples)
-        end = min(len(signal_data), peak + after_samples)
-        segments.append((start, end))
+    # 打印检测到的峰值幅值（用于调试）
+    peak_amplitudes = envelope[peaks]
+    print(f"  📊 检测到 {len(peaks)} 个峰值")
+    print(f"  📈 峰值幅值范围: 最小={np.min(peak_amplitudes):.4f}, 最大={np.max(peak_amplitudes):.4f}, 平均={np.mean(peak_amplitudes):.4f}")
+    print(f"  🔍 所有峰值幅值: {[f'{a:.4f}' for a in peak_amplitudes[:10]]}{'...' if len(peak_amplitudes) > 10 else ''}")
+    
+    # 步骤3: 对每个峰值使用双门限确定起点和终点
+    max_event_samples = int(MAX_EVENT_DURATION * sample_rate)
+    min_event_samples = int(MIN_EVENT_DURATION * sample_rate)
+    segments = []
+    rejected_segments = []  # 记录被拒绝的段（用于统计）
+    
+    for i, peak_idx in enumerate(peaks):
+        peak_value = envelope[peak_idx]
+        
+        # 计算该峰的高低门限
+        high_threshold = peak_value * PEAK_HIGH_THRESHOLD_RATIO
+        low_threshold = peak_value * PEAK_LOW_THRESHOLD_RATIO
+        
+        # === 确定起点：从峰向前找到低于低门限的位置 ===
+        search_start = max(0, peak_idx - max_event_samples)
+        if i > 0:
+            search_start = max(search_start, peaks[i-1])  # 不早于上一个峰
+        
+        start_idx = search_start
+        for idx in range(peak_idx - 1, search_start - 1, -1):
+            if envelope[idx] >= low_threshold:
+                start_idx = idx
+            else:
+                break
+        
+        # === 确定终点：从峰向后找到低于低门限的位置 ===
+        search_end = min(len(envelope) - 1, peak_idx + max_event_samples)
+        if i < len(peaks) - 1:
+            search_end = min(search_end, peaks[i+1])  # 不晚于下一个峰
+        
+        end_idx = search_end
+        for idx in range(peak_idx + 1, search_end + 1):
+            if envelope[idx] >= low_threshold:
+                end_idx = idx
+            else:
+                break
+        
+        # === 合法性检查 ===
+        if end_idx <= start_idx:
+            end_idx = min(start_idx + max_event_samples // 2, len(envelope) - 1)
+        
+        # 确保不越界
+        start_idx = max(0, start_idx)
+        end_idx = min(len(envelope) - 1, end_idx)
+        
+        # 计算持续时间（毫秒）
+        duration_samples = end_idx - start_idx
+        duration_ms = duration_samples / sample_rate * 1000
+        
+        # 检查最小长度
+        if duration_samples < MIN_SEGMENT_SAMPLES:
+            rejected_segments.append({
+                'peak_idx': peak_idx,
+                'peak_amplitude': peak_value,
+                'duration_ms': duration_ms,
+                'reason': '段长度不足'
+            })
+            continue
+        
+        # 【关键验证】检查最小持续时间（过滤毛刺噪声）
+        if duration_samples < min_event_samples:
+            rejected_segments.append({
+                'peak_idx': peak_idx,
+                'peak_amplitude': peak_value,
+                'duration_ms': duration_ms,
+                'reason': f'持续时间过短(<{MIN_EVENT_DURATION*1000:.0f}ms,疑似毛刺)'
+            })
+            continue
+        
+        segments.append((start_idx, end_idx, peak_idx))
+    
+    # 打印详细统计信息
+    print(f"  ✅ 成功提取 {len(segments)} 个有效段")
+    if len(rejected_segments) > 0:
+        print(f"  ⚠️  拒绝 {len(rejected_segments)} 个可疑段:")
+        for seg in rejected_segments[:5]:  # 只显示前5个
+            print(f"     - 峰值幅值={seg['peak_amplitude']:.4f}, 持续时间={seg['duration_ms']:.1f}ms, 原因: {seg['reason']}")
+        if len(rejected_segments) > 5:
+            print(f"     ... (还有 {len(rejected_segments)-5} 个被拒绝)")
+    
+    # 打印有效段的持续时间统计
+    if len(segments) > 0:
+        durations_ms = [(end - start) / sample_rate * 1000 for start, end, _ in segments]
+        print(f"  📏 有效段持续时间: 最小={np.min(durations_ms):.1f}ms, 最大={np.max(durations_ms):.1f}ms, 平均={np.mean(durations_ms):.1f}ms")
+        
+        # 统计持续时间分布
+        short_count = sum(1 for d in durations_ms if d < 20)
+        medium_count = sum(1 for d in durations_ms if 20 <= d < 50)
+        long_count = sum(1 for d in durations_ms if d >= 50)
+        print(f"  📊 持续时间分布: <20ms({short_count}个), 20-50ms({medium_count}个), ≥50ms({long_count}个)")
+    
+    print()  # 空行
     
     return segments
 
 
 def plot_endpoint_detection(signal_data, segments, filename, sample_rate=SAMPLE_RATE):
-    """绘制端点检测效果图（包含包络和峰值标记）"""
+    """绘制端点检测效果图（包含包络、峰值和谷底切分标记）"""
     time = np.arange(len(signal_data)) / sample_rate
     
     # 计算包络用于显示
@@ -133,31 +258,40 @@ def plot_endpoint_detection(signal_data, segments, filename, sample_rate=SAMPLE_
     
     # 上图：原始信号 + 端点标记
     axes[0].plot(time, signal_data, 'b-', linewidth=0.5, alpha=0.7, label='原始信号')
-    for i, (start, end) in enumerate(segments):
+    for i, (start, end, peak) in enumerate(segments):
         start_time = start / sample_rate
         end_time = end / sample_rate
-        peak_time = start_time + SEGMENT_BEFORE_PEAK  # 峰值位置
-        axes[0].axvline(x=peak_time, color='r', linestyle='-', linewidth=1.5, alpha=0.8)
-        axes[0].axvline(x=start_time, color='g', linestyle='--', linewidth=1, alpha=0.5)
-        axes[0].axvline(x=end_time, color='g', linestyle='--', linewidth=1, alpha=0.5)
+        peak_time = peak / sample_rate
+        axes[0].axvline(x=peak_time, color='r', linestyle='-', linewidth=1.0, alpha=0.8)
+        axes[0].axvline(x=start_time, color='g', linestyle='--', linewidth=0.5, alpha=0.5)
+        axes[0].axvline(x=end_time, color='g', linestyle='--', linewidth=0.5, alpha=0.5)
     
     axes[0].set_ylabel('幅值')
-    axes[0].set_title('原始信号与检测到的敲击峰值（红线）')
+    axes[0].set_title('原始信号与检测到的敲击（红线=峰值，绿虚线=段边界）')
     axes[0].set_ylim([-1, 1])
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
     
-    # 下图：包络 + 峰值标记
+    # 下图：包络 + 峰值和切分点标记
     axes[1].plot(time, envelope, 'b-', linewidth=1, label='包络')
-    for i, (start, end) in enumerate(segments):
-        peak_time = start / sample_rate + SEGMENT_BEFORE_PEAK
-        peak_idx = int(peak_time * sample_rate)
-        if 0 <= peak_idx < len(envelope):
-            axes[1].plot(peak_time, envelope[peak_idx], 'ro', markersize=8)
+    for i, (start, end, peak) in enumerate(segments):
+        peak_time = peak / sample_rate
+        start_time = start / sample_rate
+        end_time = end / sample_rate
+        
+        # 标记峰值
+        if 0 <= peak < len(envelope):
+            axes[1].plot(peak_time, envelope[peak], 'ro', markersize=8, zorder=5)
+        
+        # 标记谷底切分点
+        if 0 <= start < len(envelope):
+            axes[1].plot(start_time, envelope[start], 'gs', markersize=6, alpha=0.7)
+        if 0 <= end < len(envelope):
+            axes[1].plot(end_time, envelope[end], 'gs', markersize=6, alpha=0.7)
     
     axes[1].set_xlabel('时间/s')
     axes[1].set_ylabel('包络幅值')
-    axes[1].set_title('信号包络与检测到的峰值（红点）')
+    axes[1].set_title('信号包络（红圆=峰值，绿方=段边界）')
     axes[1].set_xlim([0, time[-1]])
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
@@ -174,89 +308,149 @@ def plot_endpoint_detection(signal_data, segments, filename, sample_rate=SAMPLE_
 
 
 def plot_endpoint_zoom(signal_data, segments, filename, segment_idx=0, sample_rate=SAMPLE_RATE):
-    """绘制端点检测放大图（显示某一个敲击信号，包含包络和峰值对齐）"""
+    """绘制端点检测放大图（显示某一个敲击信号，包含包络、峰值和谷底）"""
     if len(segments) == 0:
         return
     
     if segment_idx >= len(segments):
         segment_idx = len(segments) // 2  # 选择中间的一个段
     
-    start, end = segments[segment_idx]
-    peak_sample = start + int(SEGMENT_BEFORE_PEAK * sample_rate)
+    start, end, peak = segments[segment_idx]
     
-    # 扩展显示范围
-    extend_samples = int(0.3 * sample_rate)
-    plot_start = max(0, start - extend_samples)
-    plot_end = min(len(signal_data), end + extend_samples)
-    
+    # 目标：在放大图中同时显示上一个峰、当前峰和下一个峰的截取段
+    # 使用与 extract_signal_segments 相同的对齐规则来计算理想截取窗口
+    before_peak = SIGNAL_SAMPLES // 4
+    after_peak = SIGNAL_SAMPLES - before_peak
+
+    # 当前峰的理想截取范围
+    ideal_start = peak - before_peak
+    ideal_end = peak + after_peak
+
+    # 上一个峰的理想范围（若存在）
+    if segment_idx > 0:
+        prev_peak = segments[segment_idx - 1][2]
+        prev_ideal_start = prev_peak - before_peak
+        prev_ideal_end = prev_peak + after_peak
+    else:
+        prev_ideal_start = ideal_start
+        prev_ideal_end = ideal_start
+
+    # 下一个峰的理想范围（若存在）
+    if segment_idx < len(segments) - 1:
+        next_peak = segments[segment_idx + 1][2]
+        next_ideal_start = next_peak - before_peak
+        next_ideal_end = next_peak + after_peak
+    else:
+        next_ideal_start = ideal_end
+        next_ideal_end = ideal_end
+
+    # 计算整体显示范围：从上一个理想起点到下一个理想终点，并留少量边距
+    margin = int(0.01 * sample_rate)  # 10ms 边距
+    plot_start = max(0, min(prev_ideal_start, ideal_start, next_ideal_start) - margin)
+    plot_end = min(len(signal_data), max(prev_ideal_end, ideal_end, next_ideal_end) + margin)
+
     time = np.arange(plot_start, plot_end) / sample_rate
     signal_segment = signal_data[plot_start:plot_end]
-    
-    # 计算该段的包络
-    envelope_full = compute_envelope(signal_data, sample_rate=sample_rate)
-    envelope_segment = envelope_full[plot_start:plot_end]
-    
+
     fig, ax = plt.subplots(figsize=(12, 6))
-    
-    # 绘制信号和包络
-    ax.plot(time, signal_segment, 'b-', linewidth=0.8, alpha=0.7, label='信号')
-    ax.plot(time, envelope_segment, 'orange', linewidth=2, label='包络')
-    
-    # 绘制端点线和峰值
-    peak_time = peak_sample / sample_rate
-    ax.axvline(x=start/sample_rate, color='g', linestyle='--', linewidth=1.5, label='起点', alpha=0.7)
-    ax.axvline(x=end/sample_rate, color='g', linestyle='--', linewidth=1.5, label='终点', alpha=0.7)
-    ax.axvline(x=peak_time, color='r', linestyle='-', linewidth=2, label='峰值中心', alpha=0.9)
-    
-    # 标记峰值点
-    if plot_start <= peak_sample < plot_end:
-        peak_idx_local = peak_sample - plot_start
-        ax.plot(peak_time, envelope_segment[peak_idx_local], 'ro', markersize=12, zorder=5)
-    
+
+    # 仅绘制原始信号（无需包络），并用虚线标注截取窗口边界
+    ax.plot(time, signal_segment, 'b-', linewidth=0.8, alpha=0.9, label='信号')
+
+    # 绘制上/当前/下的截取窗口边界（虚线）并用图例标注
+    def mark_window_lines(s_idx, e_idx, color, label=None, linestyle='--'):
+        s_time = s_idx / sample_rate
+        e_time = e_idx / sample_rate
+        ax.axvline(x=s_time, color=color, linestyle=linestyle, linewidth=1.0, alpha=0.9)
+        ax.axvline(x=e_time, color=color, linestyle=linestyle, linewidth=1.0, alpha=0.9)
+        if label:
+            # 在图例中用一个小水平线示意（通过 plot 一个不可见点并给 label）
+            ax.plot([], [], color=color, linestyle=linestyle, linewidth=1.0, label=label)
+
+    # 上一个（蓝色），当前（绿色），下一个（蓝色）
+    mark_window_lines(max(0, prev_ideal_start), min(len(signal_data)-1, prev_ideal_end), 'C0', label='上一个峰截取段')
+    mark_window_lines(max(0, ideal_start), min(len(signal_data)-1, ideal_end), 'C2', label='当前峰截取段')
+    mark_window_lines(max(0, next_ideal_start), min(len(signal_data)-1, next_ideal_end), 'C0', label='下一个峰截取段')
+
     ax.set_xlabel('时间/s')
     ax.set_ylabel('幅值')
-    ax.set_title(f'端点检测放大图（第 {segment_idx+1} 个敲击信号）')
+    ax.set_title(f'端点检测放大图（第 {segment_idx+1} 个敲击，显示上/当前/下峰截取段）')
     ax.grid(True, alpha=0.3)
     ax.legend()
-    
+
     # 保存图片
     save_path = os.path.join(OUTPUT_DIR, "endpoints_zoom", f"{filename}_zoom.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  端点放大图已保存: {save_path}")
-    
+
     return save_path
 
 
 def extract_signal_segments(signal_data, segments, target_length=SIGNAL_SAMPLES):
     """
     从检测到的敲击段中提取固定长度的信号
-    以峰值为参考点，向前取 SEGMENT_BEFORE_PEAK，向后取剩余部分至 target_length
-    选择信号长度的原因：
-    1. 根据频域分析，敲击信号的主要能量集中在峰值前后约70ms
-    2. 固定长度便于后续的频域分析和特征提取
-    3. 以峰值对齐确保每个样本捕获的是冲击主能量部分
+    策略：
+    1. 以峰值为对齐点
+    2. 向峰值前后扩展至 target_length
+    3. 如果不够长度，用零填充（padding）
+    4. 不允许跨入下一个峰的区域
     """
     extracted = []
     
-    for start, end in segments:
-        # 峰值位置在 start + SEGMENT_BEFORE_PEAK
-        peak_sample = start + int(SEGMENT_BEFORE_PEAK * SAMPLE_RATE)
+    for i, (start, end, peak) in enumerate(segments):
+        segment_length = end - start
         
-        # 以峰值为中心，截取固定长度
-        # 为保持一致性，从start开始截取target_length
-        segment_start = start
-        segment_end = segment_start + target_length
+        # 计算以峰值为中心的理想截取范围
+        # 让峰值位于固定位置（例如 1/4 处，留更多空间给衰减）
+        before_peak = target_length // 2
+        after_peak = target_length - before_peak
+        
+        ideal_start = peak - before_peak
+        ideal_end = peak + after_peak
+        
+        # 调整起点：不能早于当前段的起点
+        actual_start = max(start, ideal_start)
+        
+        # 调整终点：不能晚于当前段的终点（不跨入下一峰）
+        actual_end = min(end, ideal_end)
         
         # 确保不越界
-        if segment_end <= len(signal_data):
-            segment = signal_data[segment_start:segment_end]
-            extracted.append(segment)
-        elif segment_start < len(signal_data):
-            # 如果剩余长度不足，补零
-            segment = signal_data[segment_start:]
-            segment = np.pad(segment, (0, target_length - len(segment)), 'constant')
-            extracted.append(segment)
+        actual_start = max(0, actual_start)
+        actual_end = min(len(signal_data), actual_end)
+        
+        # 提取信号
+        segment = signal_data[actual_start:actual_end]
+        
+        # 如果长度不足，补零
+        if len(segment) < target_length:
+            # 计算需要在前后补多少零
+            # 优先保证峰值在正确位置
+            peak_offset_in_segment = peak - actual_start
+            target_peak_position = before_peak
+            
+            if peak_offset_in_segment < target_peak_position:
+                # 需要在前面补零
+                pad_before = target_peak_position - peak_offset_in_segment
+                pad_after = target_length - len(segment) - pad_before
+            else:
+                # 正常情况
+                pad_before = 0
+                pad_after = target_length - len(segment)
+            
+            # 确保补零数量非负
+            pad_before = max(0, pad_before)
+            pad_after = max(0, target_length - len(segment) - pad_before)
+            
+            segment = np.pad(segment, (pad_before, pad_after), 'constant')
+        
+        # 如果长度超过目标，从峰值对齐的角度截取
+        if len(segment) > target_length:
+            peak_in_segment = peak - actual_start
+            cut_start = max(0, peak_in_segment - before_peak)
+            segment = segment[cut_start:cut_start + target_length]
+        
+        extracted.append(segment)
     
     return np.array(extracted)
 
