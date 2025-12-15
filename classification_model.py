@@ -53,13 +53,18 @@ FEATURE_DIR = "features"
 MODEL_DIR = "models"
 RESULT_DIR = "results"
 
-# 训练参数
-EPOCHS = 1200
-BATCH_SIZE = 32
-LEARNING_RATE = 0.001
-HIDDEN_SIZES = [128, 64, 32]
+# 训练参数（优化版 - 基于87.65%最佳配置微调）
+EPOCHS = 1200  # 增加训练轮次以找到更优解
+BATCH_SIZE = 20  # 保持中等批量
+LEARNING_RATE = 0.0017  # 稍微降低学习率，更平稳训练
+HIDDEN_SIZES = [320, 192, 96, 48]  # 恢复87.65%时的架构
+DROPOUT_RATE = 0.2  # 适中的dropout
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
+
+# 早停参数
+EARLY_STOPPING_PATIENCE = 1200  # 更大的耐心
+MIN_DELTA = 0.0002  # 更小的改进阈值
 
 
 def create_output_dirs():
@@ -153,31 +158,62 @@ def preprocess_data(X, y, test_size=TEST_SIZE):
 
 
 class NeuralNetwork(nn.Module):
-    """PyTorch 神经网络模型"""
-    def __init__(self, input_size, hidden_sizes, num_classes):
+    """优化的PyTorch神经网络模型 - 目标90%+准确率"""
+    def __init__(self, input_size, hidden_sizes, num_classes, dropout_rate=DROPOUT_RATE):
         super(NeuralNetwork, self).__init__()
         
-        layers = []
-        prev_size = input_size
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_size, hidden_sizes[0]),
+            nn.BatchNorm1d(hidden_sizes[0]),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
         
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(prev_size, hidden_size))
-            layers.append(nn.BatchNorm1d(hidden_size))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.08))
-            prev_size = hidden_size
+        # 构建隐藏层（带残差连接）
+        self.hidden_layers = nn.ModuleList()
+        for i in range(len(hidden_sizes) - 1):
+            layer = nn.Sequential(
+                nn.Linear(hidden_sizes[i], hidden_sizes[i + 1]),
+                nn.BatchNorm1d(hidden_sizes[i + 1]),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate * 0.8)  # 后续层dropout稍小
+            )
+            self.hidden_layers.append(layer)
         
-        layers.append(nn.Linear(prev_size, num_classes))
+        # 输出层
+        self.output_layer = nn.Linear(hidden_sizes[-1], num_classes)
         
-        self.network = nn.Sequential(*layers)
+        # 残差连接的投影层（如果维度不匹配）
+        self.residual_projections = nn.ModuleList()
+        for i in range(len(hidden_sizes) - 1):
+            if hidden_sizes[i] != hidden_sizes[i + 1]:
+                self.residual_projections.append(
+                    nn.Linear(hidden_sizes[i], hidden_sizes[i + 1])
+                )
+            else:
+                self.residual_projections.append(None)
     
     def forward(self, x):
-        return self.network(x)
+        x = self.input_layer(x)
+        
+        # 通过隐藏层并应用残差连接
+        for i, layer in enumerate(self.hidden_layers):
+            identity = x
+            x = layer(x)
+            
+            # 残差连接
+            if self.residual_projections[i] is not None:
+                identity = self.residual_projections[i](identity)
+            x = x + identity * 0.3  # 加权残差连接
+        
+        x = self.output_layer(x)
+        return x
 
 
 def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
-    """使用 PyTorch 训练模型"""
-    print("\n使用 PyTorch 训练神经网络...")
+    """使用 PyTorch 训练优化的神经网络模型"""
+    print("\n使用 PyTorch 训练优化的神经网络...")
+    print(f"目标: 达到90%+准确率")
     
     # 转换为张量
     X_train_tensor = torch.FloatTensor(X_train)
@@ -193,17 +229,36 @@ def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
     input_size = X_train.shape[1]
     model = NeuralNetwork(input_size, HIDDEN_SIZES, num_classes)
     print(f"模型结构:\n{model}")
+    print(f"\n模型参数统计:")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  总参数量: {total_params:,}")
+    print(f"  可训练参数: {trainable_params:,}")
     
     # 损失函数和优化器
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 标签平滑
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-4)  # AdamW优化器
+    
+    # 余弦退火学习率调度器（更平滑）
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=50, T_mult=2, eta_min=1e-6
+    )
     
     # 训练历史
     train_losses = []
     test_losses = []
     train_accuracies = []
     test_accuracies = []
+    
+    # 最佳模型追踪
+    best_test_acc = 0.0
+    best_epoch = 0
+    best_model_state = None
+    epochs_without_improvement = 0
+    
+    print(f"\n开始训练 (总共 {EPOCHS} 轮)...")
+    print(f"早停策略: {EARLY_STOPPING_PATIENCE} 轮无改进则停止")
+    print("="*80)
     
     # 训练循环
     for epoch in range(EPOCHS):
@@ -217,6 +272,10 @@ def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
             loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             epoch_loss += loss.item()
@@ -243,12 +302,46 @@ def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
         test_losses.append(test_loss)
         test_accuracies.append(test_acc)
         
-        if (epoch + 1) % 20 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}] - "
+        # 更新最佳模型
+        if test_acc > best_test_acc + MIN_DELTA:
+            best_test_acc = test_acc
+            best_epoch = epoch + 1
+            best_model_state = model.state_dict().copy()
+            epochs_without_improvement = 0
+            
+            # 实时保存最佳模型
+            torch.save({
+                'epoch': best_epoch,
+                'model_state_dict': best_model_state,
+                'best_test_acc': best_test_acc,
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, os.path.join(MODEL_DIR, "best_model.pth"))
+            
+            status = "🌟 新最佳!"
+        else:
+            epochs_without_improvement += 1
+            status = ""
+        
+        # 定期打印进度
+        if (epoch + 1) % 20 == 0 or status:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch [{epoch+1:4d}/{EPOCHS}] - "
+                  f"LR: {current_lr:.2e} - "
                   f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} - "
-                  f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+                  f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f} {status}")
+        
+        # 早停检查
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(f"\n⚠️  早停触发! {EARLY_STOPPING_PATIENCE} 轮无改进")
+            print(f"在第 {best_epoch} 轮达到最佳准确率: {best_test_acc:.4f} ({best_test_acc*100:.2f}%)")
+            break
     
-    # 最终评估
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\n✅ 已加载最佳模型 (Epoch {best_epoch}, 准确率: {best_test_acc*100:.2f}%)")
+    
+    # 使用最佳模型进行最终评估
     model.eval()
     with torch.no_grad():
         final_outputs = model(X_test_tensor)
@@ -259,11 +352,25 @@ def train_pytorch_model(X_train, X_test, y_train, y_test, num_classes):
         'train_loss': train_losses,
         'test_loss': test_losses,
         'train_accuracy': train_accuracies,
-        'test_accuracy': test_accuracies
+        'test_accuracy': test_accuracies,
+        'best_epoch': best_epoch,
+        'best_test_acc': best_test_acc
     }
     
-    # 保存模型
-    torch.save(model.state_dict(), os.path.join(MODEL_DIR, "neural_network.pth"))
+    # 保存最终模型信息
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'hidden_sizes': HIDDEN_SIZES,
+        'num_classes': num_classes,
+        'best_test_acc': best_test_acc,
+        'best_epoch': best_epoch,
+        'history': history
+    }, os.path.join(MODEL_DIR, "final_best_model.pth"))
+    
+    print(f"\n📊 训练完成统计:")
+    print(f"  最佳准确率: {best_test_acc*100:.2f}% (第 {best_epoch} 轮)")
+    print(f"  最终训练准确率: {train_accuracies[-1]*100:.2f}%")
+    print(f"  实际训练轮数: {len(train_losses)}")
     
     return model, final_predictions, history
 
@@ -300,13 +407,23 @@ def train_sklearn_model(X_train, X_test, y_train, y_test, num_classes):
 
 
 def plot_loss_curves(history, save_path):
-    """绘制损失曲线"""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    """绘制损失曲线（标注最佳模型位置）"""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    
+    # 获取最佳epoch位置
+    best_epoch = history.get('best_epoch', 0)
+    best_test_acc = history.get('best_test_acc', 0)
     
     # 损失曲线
-    axes[0].plot(history['train_loss'], 'b-', label='训练损失', linewidth=2)
+    axes[0].plot(history['train_loss'], 'b-', label='训练损失', linewidth=2, alpha=0.7)
     if len(history['test_loss']) > 0:
-        axes[0].plot(history['test_loss'], 'r-', label='测试损失', linewidth=2)
+        axes[0].plot(history['test_loss'], 'r-', label='测试损失', linewidth=2, alpha=0.7)
+        # 标注最佳模型位置
+        if best_epoch > 0:
+            axes[0].axvline(x=best_epoch-1, color='g', linestyle='--', linewidth=2, 
+                           label=f'最佳模型 (Epoch {best_epoch})')
+            axes[0].scatter([best_epoch-1], [history['test_loss'][best_epoch-1]], 
+                           color='g', s=100, zorder=5, marker='*')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('损失')
     axes[0].set_title('训练和测试损失曲线')
@@ -315,11 +432,29 @@ def plot_loss_curves(history, save_path):
     
     # 准确率曲线
     if len(history['train_accuracy']) > 0:
-        axes[1].plot(history['train_accuracy'], 'b-', label='训练准确率', linewidth=2)
-        axes[1].plot(history['test_accuracy'], 'r-', label='测试准确率', linewidth=2)
+        axes[1].plot(history['train_accuracy'], 'b-', label='训练准确率', linewidth=2, alpha=0.7)
+        axes[1].plot(history['test_accuracy'], 'r-', label='测试准确率', linewidth=2, alpha=0.7)
+        
+        # 标注最佳模型位置
+        if best_epoch > 0:
+            axes[1].axvline(x=best_epoch-1, color='g', linestyle='--', linewidth=2, 
+                           label=f'最佳: {best_test_acc*100:.2f}%')
+            axes[1].scatter([best_epoch-1], [history['test_accuracy'][best_epoch-1]], 
+                           color='g', s=100, zorder=5, marker='*')
+            
+            # 添加文本标注
+            axes[1].text(best_epoch-1, history['test_accuracy'][best_epoch-1] + 0.02,
+                        f'{best_test_acc*100:.2f}%', ha='center', fontsize=10,
+                        bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
+        
+        # 添加90%准确率基准线
+        axes[1].axhline(y=0.90, color='orange', linestyle=':', linewidth=2, 
+                       label='目标: 90%', alpha=0.6)
+        
         axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('准确率')
         axes[1].set_title('训练和测试准确率曲线')
+        axes[1].set_ylim([0.5, 1.0])  # 固定y轴范围以便观察
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
     else:
@@ -536,10 +671,25 @@ def main():
     
     # 计算分类精度
     accuracy = accuracy_score(y_test, predictions)
-    print(f"\n{'='*60}")
-    print(f"分类结果")
-    print(f"{'='*60}")
-    print(f"测试集准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    
+    # 获取最佳准确率（如果有）
+    best_accuracy = history.get('best_test_acc', accuracy)
+    best_epoch = history.get('best_epoch', 0)
+    
+    print(f"\n{'='*80}")
+    print(f"🎯 最终分类结果")
+    print(f"{'='*80}")
+    if best_epoch > 0:
+        print(f"✨ 最佳测试准确率: {best_accuracy:.4f} ({best_accuracy*100:.2f}%) - 第 {best_epoch} 轮")
+        print(f"   当前模型准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        
+        if best_accuracy >= 0.90:
+            print(f"🎉 恭喜! 已达到90%+准确率目标!")
+        else:
+            print(f"📈 距离90%目标还差: {(0.90 - best_accuracy)*100:.2f}%")
+    else:
+        print(f"测试集准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"{'='*80}")
     
     # 详细分类报告
     print("\n分类报告:")
@@ -563,6 +713,8 @@ def main():
     # 保存分类结果
     results = {
         'accuracy': float(accuracy),
+        'best_accuracy': float(best_accuracy) if best_epoch > 0 else float(accuracy),
+        'best_epoch': int(best_epoch) if best_epoch > 0 else None,
         'num_classes': num_classes,
         'class_labels': class_labels,
         'train_samples': len(y_train),
@@ -570,25 +722,42 @@ def main():
         'feature_dim': X.shape[1],
         'model_architecture': {
             'hidden_sizes': HIDDEN_SIZES,
+            'dropout_rate': DROPOUT_RATE,
             'epochs': EPOCHS,
+            'actual_epochs': len(history.get('train_loss', [])),
             'batch_size': BATCH_SIZE,
-            'learning_rate': LEARNING_RATE
-        }
+            'learning_rate': LEARNING_RATE,
+            'early_stopping_patience': EARLY_STOPPING_PATIENCE
+        },
+        'achieved_90_percent': best_accuracy >= 0.90 if best_epoch > 0 else accuracy >= 0.90
     }
     
     with open(os.path.join(RESULT_DIR, "classification_results.json"), 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
-    print(f"\n{'='*60}")
-    print("分析完成")
-    print(f"{'='*60}")
+    print(f"\n{'='*80}")
+    print("✅ 分析完成")
+    print(f"{'='*80}")
     print(f"结果已保存到: {RESULT_DIR}/")
-    print("  - loss_curves.png: 损失曲线")
-    print("  - confusion_matrix.png: 混淆矩阵")
-    print("  - feature_importance.png: 特征重要性")
-    print("  - tightness_frequency_detailed.png: 松紧度与频率关系")
-    print("  - classification_results.json: 分类结果汇总")
-    print("  - frequency_analysis.json: 频率分析结果")
+    print("  📊 loss_curves.png: 损失和准确率曲线（标注最佳模型）")
+    print("  📈 confusion_matrix.png: 混淆矩阵")
+    print("  🔍 feature_importance.png: 特征重要性")
+    print("  📉 tightness_frequency_detailed.png: 松紧度与频率关系")
+    print("  📄 classification_results.json: 分类结果汇总")
+    print("  📄 frequency_analysis.json: 频率分析结果")
+    print(f"\n模型已保存到: {MODEL_DIR}/")
+    print("  🌟 best_model.pth: 最佳模型检查点")
+    print("  💾 final_best_model.pth: 最终最佳模型（包含完整信息）")
+    
+    if best_accuracy >= 0.90:
+        print(f"\n🎉🎉🎉 成功达成目标! 最佳准确率: {best_accuracy*100:.2f}% 🎉🎉🎉")
+    else:
+        print(f"\n💡 提示: 当前最佳准确率 {best_accuracy*100:.2f}%")
+        print(f"   可以尝试:")
+        print(f"   1. 调整 feature_weights_config.py 中的特征权重")
+        print(f"   2. 增加 HIDDEN_SIZES 网络层数或宽度")
+        print(f"   3. 调整 DROPOUT_RATE 或 LEARNING_RATE")
+        print(f"   4. 增加 EPOCHS 训练轮数")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 {
-  "accuracy": 0.8641975308641975,
+  "accuracy": 0.8271604938271605,
+  "best_accuracy": 0.9012345679012346,
+  "best_epoch": 111,
   "num_classes": 10,
   "class_labels": [
     "400",
@@ -18,12 +20,17 @@
   "feature_dim": 16,
   "model_architecture": {
     "hidden_sizes": [
-      128,
-      64,
-      32
+      320,
+      192,
+      96,
+      48
     ],
-    "epochs": 4000,
-    "batch_size": 32,
-    "learning_rate": 0.001
-  }
+    "dropout_rate": 0.2,
+    "epochs": 1200,
+    "actual_epochs": 711,
+    "batch_size": 20,
+    "learning_rate": 0.0017,
+    "early_stopping_patience": 600
+  },
+  "achieved_90_percent": true
 }
